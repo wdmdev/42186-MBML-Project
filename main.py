@@ -12,6 +12,8 @@ import jax
 
 from tqdm import tqdm
 
+from pyro.infer import NUTS, MCMC
+
 
 def f(carry, D_t):
   (theta_f, theta_g, sigma, R, h_prev) = carry
@@ -29,49 +31,41 @@ def f(carry, D_t):
 
 
 def model(lambda_f, lambda_g, gamma, tau, sigma_beta, M, T, T_pred, h_dim, X_E, X_W, obs=None):
+
   with pyro.plate("season", M):
     sigma = pyro.sample("sigma", dist.HalfCauchy(tau))
-
-    with pyro.plate("hidden_dim", h_dim):
-      theta_g = pyro.sample("theta_g", dist.Normal(0, lambda_g))
-      R = pyro.sample("R", dist.HalfCauchy(gamma))
-
-      with pyro.plate("total_features", X_E.shape[1] + X_W.shape[1] + h_dim):
-        theta_f = pyro.sample("theta_f", dist.Normal(0, lambda_f))
+    R = pyro.sample("R", dist.HalfCauchy(gamma), sample_shape=(h_dim,)) 
+    theta_g = pyro.sample("theta_g", dist.Normal(0, lambda_g), sample_shape=(h_dim,))
+    theta_f = pyro.sample("theta_f", dist.Normal(0, lambda_f), sample_shape=(h_dim, X_E.shape[1] + X_W.shape[1] + h_dim))
+    beta = pyro.sample("beta", dist.Normal(0, sigma_beta), sample_shape=(X_W.shape[1],))
 
 
-    with pyro.plate("weather_features", X_W.shape[1]):
-      beta = pyro.sample("beta", dist.Normal(0, sigma_beta))
-
-  theta_f = theta_f.permute(2, 1, 0)
-  theta_g = theta_g.permute(1, 0)
-  R = R.T
-
-  """
+  print(beta.shape)
   z = pyro.sample("z", dist.Categorical(logits=X_W @ beta))
+  h = pyro.sample("h_0", dist.Normal(0, 1), sample_shape=(h_dim,))
 
+  R = R.T
+  theta_g = theta_g.T
+  theta_f = theta_f.T
   
 
-  carry = (theta_f, R, h)
-
-  D = torch.concat((X_E, X_W, z), dim=1)
-  carry_updated, outs = jax.lax.scan(f, carry, D, T+T_pred-1)
-  
-  outs = jnp.array(out)
-  mean, var = outs
-  """
-
-  h = pyro.sample("h", dist.Normal(torch.zeros(h_dim), torch.ones(h_dim)))
-  ys = []
-  for t in tqdm(pyro.plate("time", T + T_pred), total=T + T_pred):
+  for t in tqdm(pyro.plate("time", T), total=T):
     # Draw season variable zt ∼ Multinomial(zt |Softmax(XtW , β1 , . . . , βM ))
-    z = pyro.sample("z", dist.Categorical(logits=X_W[t] @ beta))
-    c = torch.concat((X_E[t], X_W[t], h))[:, None]
-    h = pyro.sample("h", dist.Normal((theta_f[z] @ c).squeeze(), R[z]))
-    y = pyro.sample("y", dist.Normal(theta_g[z] @ h, sigma[z]), obs=obs[t] if t < T else None)
-    ys.append(y)
+    c = torch.concat((X_E[t], X_W[t], h)).unsqueeze(1)
 
-  return torch.tensor(ys)
+
+    h_mean = (theta_f[z[t]].T @ c).squeeze()
+    h_var = R[z[t]]
+    h = pyro.sample(f"h_{t+1}", dist.Normal(h_mean, h_var))
+    h = h.squeeze()
+
+    if t < T - 1:
+      y_in = theta_g[z[t]] @ h
+      y_obs = pyro.sample(f"y_obs_{t+1}", dist.Normal(y_in, sigma[z[t]]), obs=obs[t])
+    else:
+      y_pred = pyro.sample(f"y_pred_{t+1}", dist.Normal(theta_g[z[t]] @ h, sigma[z[t]]), obs=None)
+
+  return y_obs, y_pred
 
 
 def get_weather_data(df):
@@ -124,7 +118,26 @@ def run():
 
   obs = torch.from_numpy(df["price actual"].values).float()
 
-  y_pred = model(
+  # kwargs = {lambda_f=0.1,
+  #   lambda_g=0.1,
+  #   gamma=0.1,
+  #   tau=0.1,
+  #   sigma_beta=0.1,
+  #   M=8,
+  #   T=len(dfW) - 100,
+  #   T_pred=100,
+  #   h_dim=10,
+  #   X_W=X_W,
+  #   X_E=X_E, 
+  #   obs=obs}
+
+  
+
+ 
+  # Run inference in Pyro
+  nuts_kernel = NUTS(model)
+  mcmc = MCMC(nuts_kernel, num_samples=800, warmup_steps=200, num_chains=1)
+  mcmc.run(
     lambda_f=0.1,
     lambda_g=0.1,
     gamma=0.1,
@@ -138,18 +151,15 @@ def run():
     X_E=X_E, 
     obs=obs
   )
-  
-
- 
 
   # Show summary of inference results
-  # mcmc.summary()
+  mcmc.summary()
 
-  fig, ax = plt.subplots(1,2)
+  # fig, ax = plt.subplots(1,2)
 
-  ax[0].plot(obs)
-  ax[1].plot(y_pred)
-  plt.show()
+  # ax[0].plot(obs)
+  # ax[1].plot(y_pred)
+  # plt.show()
 
 
 
