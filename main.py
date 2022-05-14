@@ -12,7 +12,15 @@ import jax
 
 from tqdm import tqdm
 
-from pyro.infer import NUTS, MCMC
+# from pyro.infer import NUTS, MCMC
+
+from pyro.contrib.autoguide import AutoDiagonalNormal, AutoMultivariateNormal
+from pyro.infer import MCMC, NUTS, HMC, SVI, Trace_ELBO
+from pyro.optim import Adam, ClippedAdam
+
+# from datetime import datetime
+
+# date_parser = lambda date: pd.datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
 
 
 def f(carry, D_t):
@@ -48,6 +56,9 @@ def model(lambda_f, lambda_g, gamma, tau, sigma_beta, M, T, T_pred, h_dim, X_E, 
   theta_g = theta_g.T
   theta_f = theta_f.T
   
+  T_obs = T-T_pred
+  y_obs = torch.zeros(T_obs)
+  y_pred = torch.zeros(T_pred)
 
   for t in tqdm(pyro.plate("time", T), total=T):
     # Draw season variable zt ∼ Multinomial(zt |Softmax(XtW , β1 , . . . , βM ))
@@ -59,11 +70,11 @@ def model(lambda_f, lambda_g, gamma, tau, sigma_beta, M, T, T_pred, h_dim, X_E, 
     h = pyro.sample(f"h_{t+1}", dist.Normal(h_mean, h_var))
     h = h.squeeze()
 
-    if t < T - 1:
+    if t < T - T_pred:
       y_in = theta_g[z[t]] @ h
-      y_obs = pyro.sample(f"y_obs_{t+1}", dist.Normal(y_in, sigma[z[t]]), obs=obs[t])
+      y_obs[t] = pyro.sample(f"y_obs_{t+1}", dist.Normal(y_in, sigma[z[t]]), obs=obs[t])
     else:
-      y_pred = pyro.sample(f"y_pred_{t+1}", dist.Normal(theta_g[z[t]] @ h, sigma[z[t]]), obs=None)
+      y_pred[t-T_obs] = pyro.sample(f"y_pred_{t+1}", dist.Normal(theta_g[z[t]] @ h, sigma[z[t]]), obs=None)
 
   return y_obs, y_pred
 
@@ -108,8 +119,11 @@ def get_energy_data(df):
 
 
 
-def run():
+def run(inference_method = None):
   df = pd.read_csv("preprocessed_data/df.csv").iloc[:1000]
+  df["time_str"] = [d.split("+")[0] for d in df["time_str"]]
+  print(df.head())
+  df["time_str"] = pd.to_datetime(df["time_str"], infer_datetime_format=True)#'%Y-%m-%d %H:%M:%S.%f') # 2015-01-01 10:00:00+00:00
   dfW = get_weather_data(df)
   dfE = get_energy_data(df)
 
@@ -118,51 +132,71 @@ def run():
 
   obs = torch.from_numpy(df["price actual"].values).float()
 
-  # kwargs = {lambda_f=0.1,
-  #   lambda_g=0.1,
-  #   gamma=0.1,
-  #   tau=0.1,
-  #   sigma_beta=0.1,
-  #   M=8,
-  #   T=len(dfW) - 100,
-  #   T_pred=100,
-  #   h_dim=10,
-  #   X_W=X_W,
-  #   X_E=X_E, 
-  #   obs=obs}
+  kwargs = {
+    "lambda_f":   0.1,
+    "lambda_g":   0.1,
+    "gamma":      0.1,
+    "tau":        0.1,
+    "sigma_beta": 0.1,
+    "M":          8,
+    "T":          len(dfW),# - 100,
+    "T_pred":     100,
+    "h_dim":      10,
+    "X_W":        X_W,
+    "X_E":        X_E, 
+    "obs":        obs
+    }
 
   
-
- 
   # Run inference in Pyro
-  nuts_kernel = NUTS(model)
-  mcmc = MCMC(nuts_kernel, num_samples=800, warmup_steps=200, num_chains=1)
-  mcmc.run(
-    lambda_f=0.1,
-    lambda_g=0.1,
-    gamma=0.1,
-    tau=0.1,
-    sigma_beta=0.1,
-    M=8,
-    T=len(dfW) - 100,
-    T_pred=100,
-    h_dim=10,
-    X_W=X_W,
-    X_E=X_E, 
-    obs=obs
-  )
+  if inference_method == "MCMC":
+    nuts_kernel = NUTS(model)
+    mcmc = MCMC(nuts_kernel, num_samples=800, warmup_steps=200, num_chains=1)
+    mcmc.run(**kwargs)
 
-  # Show summary of inference results
-  mcmc.summary()
+    # Show summary of inference results
+    mcmc.summary()
+  elif inference_method == "SVI":
+    # Define guide function
+    guide = AutoDiagonalNormal(model)
 
-  # fig, ax = plt.subplots(1,2)
+    # Reset parameter values
+    pyro.clear_param_store()
 
-  # ax[0].plot(obs)
-  # ax[1].plot(y_pred)
-  # plt.show()
+    # Define the number of optimization steps
+    n_steps = 12000
+
+    # Setup the optimizer
+    adam_params = {"lr": 0.01}
+    optimizer = ClippedAdam(adam_params)
+
+    # Setup the inference algorithm
+    elbo = Trace_ELBO(num_particles=3)
+    svi = SVI(model, guide, optimizer, loss=elbo)
+
+    # Do gradient steps
+    for step in range(n_steps):
+        elbo = svi.step(**kwargs)
+        if step % 500 == 0:
+            print("[%d] ELBO: %.1f" % (step, elbo))
+  else:
+    y_obs, y_pred = model(**kwargs)
+
+    fig, ax = plt.subplots(1,2, figsize = (12,6))
+
+    ax[0].plot(df.time_str[:len(y_obs)], obs[:len(y_obs)])
+    plt.setp(ax[0].get_xticklabels(), rotation = 45)
+    ax[0].set_title("From data")
+
+    ax[1].plot(df.time_str[:len(y_obs)], y_obs)
+    plt.setp(ax[1].get_xticklabels(), rotation = 45)
+    ax[1].set_title("From model")
+
+
+    plt.show()
 
 
 
 
 if __name__ == "__main__":
-  run()
+  run("SVI")
