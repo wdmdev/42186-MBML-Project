@@ -20,7 +20,7 @@ from tqdm import tqdm
 from pyro import poutine
 from pyro.optim import Adam
 from pyro.infer import NUTS, MCMC, config_enumerate, Trace_ELBO, TraceEnum_ELBO, SVI
-from pyro.infer.autoguide import AutoNormal, AutoDelta
+from pyro.infer.autoguide import AutoNormal, AutoDelta, AutoDiagonalNormal
 
 
 
@@ -111,7 +111,7 @@ def get_energy_data(df):
   return dfE
 
 
-def run():
+def run(method: str):
   df = pd.read_csv("preprocessed_data/df.csv").iloc[:1000]
   dfW = get_weather_data(df)
   dfE = get_energy_data(df)
@@ -124,38 +124,49 @@ def run():
   T = len(dfW) - 1
   T_pred = 0
 
-  optim = Adam({ 'lr': 1e-3 })
-  elbo = TraceEnum_ELBO(max_plate_nesting=1)
-  guide = AutoNormal(poutine.block(model, hide=[f"z_{i}" for i in range(T + T_pred + 1)]))
+  kwargs = {
+    "lambda_f":   0.1,
+    "lambda_g":   0.1,
+    "gamma":      0.1,
+    "tau":        0.1,
+    "sigma_alpha":0.1,
+    "sigma_beta": 0.1,
+    "M":          8,
+    "T":          T,
+    "T_pred":     T_pred,
+    "h_dim":      10,
+    "X_W":        X_W,
+    "X_E":        X_E, 
+    "obs":        obs
+  }
 
-  svi = SVI(model, guide, optim, elbo)
 
-  tqdm_loop = tqdm(range(100))
+  if method == "MCMC":
+    nuts_kernel = NUTS(model)
+    mcmc = MCMC(nuts_kernel, num_samples=800, warmup_steps=0, num_chains=4)
+    mcmc.run(**kwargs)
+    # Show summary of inference results
+    mcmc.summary()
+    
+  elif method == "SVI":
+    optim = Adam({ 'lr': 1e-3 })
+    elbo = TraceEnum_ELBO(max_plate_nesting=1)
+    guide = AutoNormal(poutine.block(model, hide=[f"z_{i}" for i in range(T + T_pred + 1)]))
 
-  # Do actual dataloading here.
-  loss_history = []
-  for i in tqdm_loop:
-    loss = svi.step(
-      lambda_f=0.1,
-      lambda_g=0.1,
-      gamma=0.1,
-      tau=0.1,
-      sigma_alpha=0.1,
-      sigma_beta=0.1,
-      M=8,
-      T=T,
-      T_pred=T_pred,
-      h_dim=10,
-      X_W=X_W,
-      X_E=X_E, 
-      obs=obs
-    )
-    loss_history.append(loss)
-    tqdm_loop.set_description(f"loss={loss:.2f}")
+    svi = SVI(model, guide, optim, elbo)
 
-  plt.plot(loss_history)
-  plt.show()
+    tqdm_loop = tqdm(range(100))
+
+    # Do actual dataloading here.
+    loss_history = []
+    for i in tqdm_loop:
+      loss = svi.step(**kwargs)
+      loss_history.append(loss)
+      tqdm_loop.set_description(f"loss={loss:.2f}")
+
+    plt.plot(loss_history)
+    plt.show()
 
 
 if __name__ == "__main__":
-  run()
+  run("SVI")
