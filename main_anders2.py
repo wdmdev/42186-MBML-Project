@@ -20,13 +20,15 @@ from tqdm import tqdm
 from pyro import poutine
 from pyro.optim import Adam
 from pyro.infer import NUTS, MCMC, config_enumerate, Trace_ELBO, TraceEnum_ELBO, SVI
-from pyro.infer.autoguide import AutoNormal
+from pyro.infer.autoguide import AutoNormal, AutoDelta
 
 
 
 def model(lambda_f, lambda_g, gamma, tau, sigma_alpha, sigma_beta, M, T, T_pred, h_dim, X_E, X_W, obs=None):
 
   X = torch.cat([X_E, X_W], dim=1)
+  y_obs = None
+  y_pred = None
 
   season_plate = pyro.plate("season", M)
   with season_plate:
@@ -119,8 +121,8 @@ def run():
 
   obs = torch.from_numpy(df["price actual"].values).float()
 
-  T = 100 #len(dfW) - 100
-  T_pred = 10
+  T = len(dfW) - 1
+  T_pred = 0
 
   optim = Adam({ 'lr': 1e-3 })
   elbo = TraceEnum_ELBO(max_plate_nesting=1)
